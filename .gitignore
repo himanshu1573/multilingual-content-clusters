@@ -1,0 +1,8 @@
+.venv/
+outputs/
+cluster_state/
+*.xlsx
+*.csv
+*.json
+__pycache__/
+.DS_Store
