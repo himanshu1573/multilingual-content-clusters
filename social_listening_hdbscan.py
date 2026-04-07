@@ -11,6 +11,7 @@ import hdbscan
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import plotly.express as px
+from sklearn.metrics import silhouette_score, calinski_harabasz_score
 
 # Configuration
 SIMILARITY_THRESHOLD = 0.60
@@ -92,7 +93,7 @@ def run_fit(input_file, text_column):
     umap_embeddings = reducer.fit_transform(embeddings)
 
     print("Clustering with HDBSCAN...")
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=MIN_CLUSTER_SIZE, metric='euclidean', cluster_selection_method='eom')
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=MIN_CLUSTER_SIZE, min_samples=2, metric='euclidean', cluster_selection_method='eom')
     cluster_labels = clusterer.fit_predict(umap_embeddings)
 
     valid_df['cluster'] = cluster_labels
@@ -113,8 +114,27 @@ def run_fit(input_file, text_column):
         keywords = extract_keywords(cluster_docs)
         cluster_names[int(label)] = " | ".join(keywords)
 
-    save_state(np.array(centroids), cluster_names)
+    centroids_array = np.array(centroids)
+    save_state(centroids_array, cluster_names)
     
+    # --- Soft-assign Noise to Nearest Topic ---
+    print(f"Re-assigning noise points (similarity > {SIMILARITY_THRESHOLD})...")
+    noise_mask = valid_df['cluster'] == -1
+    if noise_mask.sum() > 0 and len(centroids) > 0:
+        noise_embeddings = embeddings[noise_mask]
+        similarities = cosine_similarity(noise_embeddings, centroids_array)
+        max_sim_indices = np.argmax(similarities, axis=1)
+        max_sim_values = np.max(similarities, axis=1)
+        
+        new_labels = []
+        for i, sim in enumerate(max_sim_values):
+            if sim >= SIMILARITY_THRESHOLD:
+                new_labels.append(unique_labels[max_sim_indices[i]])
+            else:
+                new_labels.append(-1)
+                
+        valid_df.loc[noise_mask, 'cluster'] = new_labels
+
     # Add cluster names to dataframe
     valid_df['topic_name'] = valid_df['cluster'].map(lambda x: cluster_names.get(x, "Uncategorized"))
     
@@ -184,9 +204,69 @@ def run_predict(input_file, text_column, threshold):
 
     print(f"Assigned results saved to {OUTPUT_DIR}")
 
+def run_evaluate(input_file, text_column):
+    """Calculate clustering quality metrics."""
+    if not OUTPUT_DIR.exists():
+        print("Error: No output directory found. Please run --mode fit first.")
+        return
+
+    # Load previously clustered data
+    data_file = OUTPUT_DIR / "clustered_data.csv"
+    if not data_file.exists():
+        print("Error: clustered_data.csv not found. Please run --mode fit first.")
+        return
+    
+    df = pd.read_csv(data_file)
+    print(f"Evaluating {len(df)} records...")
+
+    # Load model to get embeddings for the report (we need them for silhouette score)
+    model = get_embedder()
+    df['clean_text'] = df[text_column].apply(normalize_hinglish)
+    valid_df = df[df['clean_text'] != ""].copy()
+    embeddings = model.encode(valid_df['clean_text'].tolist(), show_progress_bar=True)
+    
+    labels = valid_df['cluster'].values
+    
+    # Filter out noise (-1) for internal metrics
+    mask = (labels != -1)
+    clustered_embeddings = embeddings[mask]
+    clustered_labels = labels[mask]
+    
+    n_total = len(labels)
+    n_noise = np.sum(labels == -1)
+    noise_pct = (n_noise / n_total) * 100
+    
+    metrics = {
+        "total_records": n_total,
+        "clustered_records": len(clustered_labels),
+        "uncategorized_count": int(n_noise),
+        "uncategorized_percent": round(noise_pct, 2),
+        "number_of_topics": int(len(np.unique(clustered_labels)))
+    }
+
+    if len(np.unique(clustered_labels)) > 1:
+        print("Calculating Silhouette Score (this may take a moment)...")
+        # Silhouette Score is expensive on large datasets, so we sample if needed
+        sample_size = min(10000, len(clustered_labels))
+        s_score = silhouette_score(clustered_embeddings, clustered_labels, sample_size=sample_size, random_state=42)
+        ch_index = calinski_harabasz_score(clustered_embeddings, clustered_labels)
+        metrics["silhouette_score"] = round(float(s_score), 4)
+        metrics["calinski_harabasz_score"] = round(float(ch_index), 2)
+    else:
+        metrics["silhouette_score"] = "N/A (Too few clusters)"
+        metrics["calinski_harabasz_index"] = "N/A"
+
+    print("\n--- Clustering Quality Report ---")
+    for k, v in metrics.items():
+        print(f"{k.replace('_', ' ').title()}: {v}")
+    
+    with open(OUTPUT_DIR / "evaluation_report.json", "w") as f:
+        json.dump(metrics, f, indent=4)
+    print(f"\nReport saved to {OUTPUT_DIR / 'evaluation_report.json'}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Clustering and naming social media content groups.")
-    parser.add_argument("--mode", choices=["fit", "predict"], required=True, help="Mode: 'fit' for initial run, 'predict' for incremental.")
+    parser.add_argument("--mode", choices=["fit", "predict", "evaluate"], required=True, help="Mode: 'fit' for initial run, 'predict' for incremental, 'evaluate' for metrics.")
     parser.add_argument("--input", required=True, help="Path to input CSV or XLSX file.")
     parser.add_argument("--column", default="title", help="Name of the text column to cluster.")
     parser.add_argument("--threshold", type=float, default=SIMILARITY_THRESHOLD, help="Cosine similarity threshold for assignment.")
@@ -195,5 +275,7 @@ if __name__ == "__main__":
     
     if args.mode == "fit":
         run_fit(args.input, args.column)
+    elif args.mode == "evaluate":
+        run_evaluate(args.input, args.column)
     else:
         run_predict(args.input, args.column, args.threshold)
