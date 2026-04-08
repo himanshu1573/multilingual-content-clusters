@@ -1,43 +1,61 @@
 # Social Media Content Clustering
 
-A high-fidelity clustering solution for social media content (specifically video titles) supporting English, Hindi, and Hinglish.
+This repo now focuses on one workflow: BERTopic-based clustering for multilingual social media titles, with optional local LLM labeling through Ollama.
 
-## Features
-- **Multilingual Support**: Uses the `LaBSE` (Language-Agnostic BERT Sentence Embedding) model.
-- **Hinglish Normalization**: Custom preprocessing to handle mixed-language text and Devanagari characters.
-- **Advanced Clustering**: Combines UMAP for dimensionality reduction and HDBSCAN for density-based clustering.
-- **Topic Naming**: Automatically generates topic names using TF-IDF keyword extraction.
-- **Incremental Assignment**: Assign new content to existing topics based on semantic similarity.
-- **Interactive Visualization**: Generates Plotly-based HTML scatter plots.
+## Main Files
+- `social_listening_bertopic.py`: primary clustering pipeline
+- `relabel_bertopic_outputs.py`: applies local LLM labels to an existing BERTopic run
+- `BERTopic_WORKFLOW.md`: full workflow notes and results
 
 ## Installation
-Ensure you have a Python environment (3.10+) and install dependencies:
+Use Python `3.10+` and install the dependencies:
 ```bash
-pip install pandas openpyxl sentence-transformers hdbscan umap-learn plotly scikit-learn
+pip install -r requirements.txt
 ```
 
-## Usage
-
-### 1. Initial Clustering (Fit)
-Process your main dataset to identify topics and save the cluster state.
+For local LLM labels on an 8 GB Mac:
 ```bash
-python social_listening_hdbscan.py --mode fit --input "Video Titles.xlsx" --column "title"
+brew install ollama
+brew services start ollama
+ollama pull qwen2.5:3b
 ```
-**Outputs:**
-- `outputs/clustered_data.csv`: Your data with assigned cluster IDs and topic names.
-- `outputs/cluster_visualization.html`: Interactive 2D visualization of the clusters.
-- `cluster_state/`: Directory containing saved centroids and metadata.
 
-### 2. Incremental Assignment (Predict)
-Assign new video titles to the topics identified in the first run.
+## Main Run
+Run BERTopic on the Excel sheet:
 ```bash
-python social_listening_hdbscan.py --mode predict --input "new_batch.csv" --column "title" --threshold 0.60
+.venv/bin/python social_listening_bertopic.py \
+  --input "Video Titles.xlsx" \
+  --input-type xlsx \
+  --column title \
+  --embedding-model sentence-transformers/LaBSE \
+  --label-mode llm \
+  --llm-provider ollama \
+  --llm-model qwen2.5:3b \
+  --min-cluster-size 20 \
+  --min-samples 5 \
+  --nr-topics auto \
+  --output-dir outputs/bertopic_titles_labse_llm_clean \
+  --no-visualize
 ```
-**Outputs:**
-- `outputs/incremental_assignment_results.csv`: New titles with assigned topics and similarity scores.
-- `outputs/flagged_new_topics.csv`: Titles that did not match any existing topic with sufficient similarity.
 
-## Configuration
-- `SIMILARITY_THRESHOLD`: Default `0.60`. Increase for stricter matching.
-- `MIN_CLUSTER_SIZE`: Default `5`. Minimum number of items to form a new topic.
-# multilingual-content-clusters
+Outputs:
+- `outputs/bertopic_titles_labse_llm_clean/bertopic_clustered_documents.csv`
+- `outputs/bertopic_titles_labse_llm_clean/bertopic_topic_summary.csv`
+- `outputs/bertopic_titles_labse_llm_clean/bertopic_topic_summary.json`
+
+## Relabel Only
+To relabel an existing BERTopic output without rerunning embeddings:
+```bash
+.venv/bin/python relabel_bertopic_outputs.py \
+  --output-dir outputs/bertopic_titles_labse_llm_clean \
+  --llm-model qwen2.5:3b
+```
+
+## Current Best Run
+- cleaned rows used: `8932`
+- topics excluding noise: `27`
+- noise rows: `2212`
+- silhouette score: `0.0769`
+- labels generated with local `qwen2.5:3b`
+
+Detailed workflow notes live in `BERTopic_WORKFLOW.md`.
