@@ -2,7 +2,9 @@ import argparse
 import hashlib
 import html
 import json
+import os
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -75,8 +77,109 @@ DOMAIN_STOPS = {
     "youtube",
 }
 
-STOPS = set(ENGLISH_STOP_WORDS) | MONTHS | DOMAIN_STOPS
+EXPERIMENT_STOPWORDS = {
+    "aajtak",
+    "aajtakdigital",
+    "ndtvindia",
+    "timesnownavbharat",
+    "tv9",
+    "tv9d",
+    "news18",
+    "n18s",
+    "topnews",
+    "parliamentnews",
+    "shortvideo",
+    "shortsvideo",
+    "viralshorts",
+    "political",
+}
+
+STOPS = set(ENGLISH_STOP_WORDS) | MONTHS | DOMAIN_STOPS | EXPERIMENT_STOPWORDS
 TEXT_CANDIDATES = ("content", "text", "post", "title", "description", "caption")
+
+CANONICAL_PATTERNS = [
+    (re.compile(r"\brahul\s+gandhi\b|\brahulgandhi\b", re.IGNORECASE), " rahul_gandhi "),
+    (
+        re.compile(
+            r"\bhimanta\s+biswa\s+sarma\b|\bhimantabiswasarma\b|\bhemantabiswasarma\b",
+            re.IGNORECASE,
+        ),
+        " himanta_biswa_sarma ",
+    ),
+    (re.compile(r"\bpriyanka\s+gandhi\b|\bpriyankagandhi\b", re.IGNORECASE), " priyanka_gandhi "),
+    (re.compile(r"\bakhilesh\s+yadav\b|\bakhileshyadav\b", re.IGNORECASE), " akhilesh_yadav "),
+    (re.compile(r"\bbhagwant\s+mann\b", re.IGNORECASE), " bhagwant_mann "),
+    (re.compile(r"\bravi\s+kishan\b|\bravikishan\b", re.IGNORECASE), " ravi_kishan "),
+    (re.compile(r"\brekha\s+gupta\b", re.IGNORECASE), " rekha_gupta "),
+    (re.compile(r"\bwomen\s+reservation\s+bill\b", re.IGNORECASE), " women_reservation_bill "),
+    (re.compile(r"\bmahila\s+aarakshan\b|\bमहिला\s+आरक्षण\b"), " women_reservation_bill "),
+    (re.compile(r"\bdelhi\s+assembly\b", re.IGNORECASE), " delhi_assembly "),
+    (re.compile(r"\bpress\s+conference\b", re.IGNORECASE), " press_conference "),
+    (re.compile(r"\bbjp\b", re.IGNORECASE), " bjp "),
+    (re.compile(r"\bcongress\b", re.IGNORECASE), " congress "),
+    (re.compile(r"\baap\b", re.IGNORECASE), " aap "),
+    (re.compile(r"\bassam\b", re.IGNORECASE), " assam "),
+    (re.compile(r"\bdelhi\b", re.IGNORECASE), " delhi "),
+]
+
+COARSE_BUCKET_RULES = {
+    "international_conflict": {
+        "iran",
+        "israel",
+        "trump",
+        "middleeastwar",
+        "hormuz",
+        "tehran",
+        "america",
+        "usa",
+        "war",
+    },
+    "elections_politics": {
+        "assam",
+        "election",
+        "elections",
+        "poll",
+        "polls",
+        "rahul_gandhi",
+        "himanta_biswa_sarma",
+        "bjp",
+        "congress",
+        "akhilesh_yadav",
+        "priyanka_gandhi",
+        "bhagwant_mann",
+    },
+    "parliament_policy": {
+        "women_reservation_bill",
+        "reservation",
+        "parliament",
+        "lok",
+        "sabha",
+        "bill",
+        "policy",
+        "aarakshan",
+        "आरक्षण",
+    },
+    "local_security": {
+        "bulldozer",
+        "mumbai",
+        "delhi_assembly",
+        "security",
+        "breach",
+        "crime",
+        "police",
+        "unnao",
+    },
+    "entertainment_misc": {
+        "virat",
+        "anushka",
+        "dhurandhar",
+        "celeb",
+        "movie",
+        "actor",
+        "girl",
+        "vada",
+    },
+}
 
 AC_CODE_RE = re.compile(r"AC/\d{1,4}/\d{1,4}", re.IGNORECASE)
 URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
@@ -103,6 +206,14 @@ def ensure_base_dependencies() -> tuple[Any, Any, Any, Any, Any, Any]:
         ) from exc
 
     return BERTopic, KeyBERTInspired, MaximalMarginalRelevance, hdbscan, px, SentenceTransformer, umap
+
+
+def load_embedder(sentence_transformer_cls: Any, model_name: str) -> Any:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    try:
+        return sentence_transformer_cls(model_name, local_files_only=True)
+    except TypeError:
+        return sentence_transformer_cls(model_name)
 
 
 def parse_nr_topics(value: str | None) -> int | str | None:
@@ -151,6 +262,32 @@ def normalize_text(text: str) -> str:
             continue
         tokens.append(token)
     return MULTISPACE_RE.sub(" ", " ".join(tokens)).strip()
+
+
+def normalize_entities(text: str) -> str:
+    value = html.unescape(text or "")
+    for pattern, replacement in CANONICAL_PATTERNS:
+        value = pattern.sub(replacement, value)
+    return value
+
+
+def build_variant_text(raw_text: str, variant: str) -> str:
+    source = raw_text
+    if variant == "ner":
+        source = normalize_entities(source)
+    return normalize_text(source)
+
+
+def assign_coarse_bucket(clean_text: str) -> str:
+    tokens = set(clean_text.split())
+    best_bucket = "general_misc"
+    best_score = 0
+    for bucket, rules in COARSE_BUCKET_RULES.items():
+        score = len(tokens & rules)
+        if score > best_score:
+            best_bucket = bucket
+            best_score = score
+    return best_bucket
 
 
 def choose_text_column(df: pd.DataFrame, requested: str | None) -> str:
@@ -224,7 +361,9 @@ def load_input(path: Path, input_type: str, column: str | None, json_text_key: s
 
     df["raw_text"] = df["raw_text"].fillna("").astype(str).str.strip()
     df = df[df["raw_text"] != ""].copy()
-    df["clean_text"] = df["raw_text"].map(normalize_text)
+    df["clean_text"] = df["raw_text"].map(lambda text: build_variant_text(text, "clean"))
+    df["ner_text"] = df["raw_text"].map(lambda text: build_variant_text(text, "ner"))
+    df["coarse_bucket"] = df["ner_text"].map(assign_coarse_bucket)
     df = df[df["clean_text"] != ""].reset_index(drop=True)
     return df
 
@@ -232,7 +371,14 @@ def load_input(path: Path, input_type: str, column: str | None, json_text_key: s
 def dedupe_documents(df: pd.DataFrame, enabled: bool) -> pd.DataFrame:
     if not enabled:
         return df.reset_index(drop=True)
-    return df.drop_duplicates(subset=["clean_text"]).reset_index(drop=True)
+    subset = ["clean_text"]
+    if "ner_text" in df.columns:
+        subset.append("ner_text")
+    return df.drop_duplicates(subset=subset).reset_index(drop=True)
+
+
+def select_text_column(df: pd.DataFrame, text_variant: str) -> str:
+    return "ner_text" if text_variant == "ner" else "clean_text"
 
 
 def build_keyword_label(keywords: list[str], fallback_id: int) -> str:
@@ -506,6 +652,92 @@ def calculate_metrics(embeddings: np.ndarray, topic_ids: np.ndarray) -> dict[str
     return metrics
 
 
+def build_topic_model(
+    BERTopic: Any,
+    KeyBERTInspired: Any,
+    MaximalMarginalRelevance: Any,
+    hdbscan_module: Any,
+    umap_module: Any,
+    embedder: Any,
+    min_cluster_size: int,
+    min_samples: int,
+    umap_n_neighbors: int,
+    umap_components: int,
+    umap_min_dist: float,
+    min_df: int,
+    max_df: float,
+    nr_topics: int | str | None,
+    top_n_words: int,
+    doc_count: int | None = None,
+) -> Any:
+    safe_min_df: int | float = min_df
+    safe_max_df: int | float = max_df
+    if doc_count is not None and doc_count > 0:
+        max_doc_freq = max_df * doc_count if isinstance(max_df, float) else max_df
+        if max_doc_freq < min_df:
+            safe_min_df = 1
+            safe_max_df = 1.0
+
+    vectorizer = CountVectorizer(
+        stop_words="english",
+        ngram_range=(1, 3),
+        min_df=safe_min_df,
+        max_df=safe_max_df,
+    )
+    umap_model = umap_module.UMAP(
+        n_neighbors=umap_n_neighbors,
+        n_components=umap_components,
+        min_dist=umap_min_dist,
+        metric="cosine",
+        random_state=42,
+    )
+    hdbscan_model = hdbscan_module.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        metric="euclidean",
+        cluster_selection_method="eom",
+        prediction_data=True,
+    )
+    representation_model = {
+        "Main": KeyBERTInspired(),
+        "MMR": MaximalMarginalRelevance(diversity=0.3),
+    }
+    return BERTopic(
+        embedding_model=embedder,
+        umap_model=umap_model,
+        hdbscan_model=hdbscan_model,
+        vectorizer_model=vectorizer,
+        representation_model=representation_model,
+        verbose=True,
+        nr_topics=nr_topics,
+        top_n_words=top_n_words,
+    )
+
+
+def run_topic_model(
+    docs_df: pd.DataFrame,
+    docs: list[str],
+    embeddings: np.ndarray,
+    topic_model: Any,
+    text_column: str,
+) -> tuple[pd.DataFrame, list[int], Any]:
+    topics, _ = topic_model.fit_transform(docs, embeddings)
+    result_df = docs_df.copy()
+    result_df["model_text"] = result_df[text_column]
+    result_df["topic_id"] = topics
+    return result_df, topics, topic_model
+
+
+def calculate_dominance(topic_ids: list[int]) -> float:
+    if not topic_ids:
+        return 0.0
+    counts = Counter(topic_ids)
+    counts.pop(-1, None)
+    if not counts:
+        return 0.0
+    return round(max(counts.values()) / len(topic_ids), 4)
+
+
 def write_outputs(
     output_dir: Path,
     docs_df: pd.DataFrame,
@@ -731,7 +963,7 @@ def main() -> None:
     print(f"Loaded {len(docs_df)} cleaned documents from {input_path.name}")
     print(f"Embedding model: {args.embedding_model}")
 
-    embedder = SentenceTransformer(args.embedding_model)
+    embedder = load_embedder(SentenceTransformer, args.embedding_model)
     embeddings = embedder.encode(
         docs,
         show_progress_bar=True,
