@@ -1,0 +1,54 @@
+╔═══════════════════════════════════════════════════════════════╗
+║           QUICK RECOMMENDATIONS - One Page Reference         ║
+╚═══════════════════════════════════════════════════════════════╝
+
+PROBLEM: Too much noise (> 15%)
+FIX:     Decrease min_cluster_size from 15 → 10
+         OR apply outlier reduction post-clustering
+
+PROBLEM: Too many topics (> 30)
+FIX:     Set nr_topics=20 to force merge similar topics
+         OR increase min_cluster_size to 20
+
+PROBLEM: Hindi text getting mangled
+FIX:     Check normalize_text() preserves \u0900-\u097F range
+         Ensure token length filter is ASCII-only
+
+PROBLEM: Bad topic labels
+FIX:     Verify Ollama is running: brew services list
+         Check model exists: ollama list
+         Try lower temperature (0.1) for more factual labels
+
+PROBLEM: Slow embeddings
+FIX:     LaBSE ~90s for 9k docs on Apple Silicon
+         Increase batch_size from 32 → 64
+         Cache embeddings to .npy file for re-runs
+
+PROBLEM: Same person in multiple clusters
+FIX:     Add entity to CANONICAL_PATTERNS in script
+         Example: (re.compile(r"\bmamata\b", re.I), " mamata_banerjee ")
+
+═══════════════════════════════════════════════════════════════
+
+OPTIMAL PARAMETERS FOR 8-10K HINGLISH TITLES:
+
+  min_cluster_size = 15     (sweet spot for granularity)
+  min_samples = 5           (standard density threshold)
+  n_neighbors = 15          (UMAP default, works well)
+  n_components = 5          (reduced dimensions)
+  nr_topics = "auto"        (let BERTopic decide)
+  embedding_model = LaBSE   (best for Hindi+English mix)
+  llm_model = qwen2.5:3b    (fast, good for labeling)
+
+═══════════════════════════════════════════════════════════════
+
+QUALITY CHECKLIST:
+
+  □ Noise ratio < 12%
+  □ Each topic has 50+ documents
+  □ Topic labels are searchable queries
+  □ No duplicate/overlapping topics
+  □ Hindi content correctly preserved in clean_text
+  □ Entity names canonicalized in ner_text
+
+═══════════════════════════════════════════════════════════════

@@ -1,0 +1,90 @@
+╔═══════════════════════════════════════════════════════════════╗
+║              EXACT CODE CHANGES - Before vs After            ║
+╚═══════════════════════════════════════════════════════════════╝
+
+FILE: social_listening_bertopic.py
+
+═══════════════════════════════════════════════════════════════
+CHANGE 1: Hindi Stopword Expansion (Line ~97)
+═══════════════════════════════════════════════════════════════
+
+BEFORE:
+  HINDI_STOPS = {"में", "के", "की", "का", "पर", "ने", "को", "से", "है", "क्या"}
+
+AFTER:
+  HINDI_STOPS = {
+      "में", "के", "की", "का", "पर", "ने", "को", "से", "है", "क्या",
+      "हो", "था", "थी", "थे", "गया", "गई", "गए", "कर", "किया", "दिया", "लिया",
+      "होना", "करना", "लेकिन", "मगर", "और", "भी", "ही", "कि", "जो", "तो",
+      "ये", "वे", "वह", "इस", "उस", "उसे", "इसे", "इसकी", "उसकी", "उनका",
+      "अपना", "अपने", "अपनी", "सब", "कोई", "कुछ", "बहुत", "कम", "ज्यादा",
+      "वही", "सही", "गलत", "सा", "सी", "तक", "लिए", "बारे", "बीच", "वाले",
+      "वाली", "वाला", "हैं", "रहे", "रही", "रहा", "सकते", "सकता", "सकती"
+  }
+
+WHY: 10 stopwords was insufficient. Hindi function words polluted embeddings.
+
+═══════════════════════════════════════════════════════════════
+CHANGE 2: Token Length Filter (Line ~283)
+═══════════════════════════════════════════════════════════════
+
+BEFORE:
+  tokens = []
+  for token in text.split():
+      if len(token) <= 2:          # <-- PROBLEM: kills Hindi tokens
+          continue
+      if token.isascii() and token in STOPS:
+          continue
+      tokens.append(token)
+
+AFTER:
+  tokens = []
+  for token in text.split():
+      if token.isascii() and len(token) <= 2:   # <-- FIX: ASCII-only filter
+          continue
+      if token in STOPS:                         # <-- FIX: check ALL stops
+          continue
+      tokens.append(token)
+
+WHY: Hindi tokens "हो" (2 chars, means "happen") were being deleted. Now only
+     short ASCII tokens like "is", "we", "at" are filtered by length.
+
+═══════════════════════════════════════════════════════════════
+CHANGE 3: CSV Loader Robustness (Line ~362)
+═══════════════════════════════════════════════════════════════
+
+BEFORE:
+  if input_type == "csv":
+      df = pd.read_csv(path)
+
+AFTER:
+  if input_type == "csv":
+      try:
+          df = pd.read_csv(path)
+      except Exception:
+          df = pd.read_csv(path, sep="\v", engine="python")
+
+WHY: Video titles contain commas. Standard CSV parser treats them as delimiters.
+     Fallback uses vertical tab as separator to force single-column reading.
+
+═══════════════════════════════════════════════════════════════
+CHANGE 4: Output Column Simplification (Line ~778)
+═══════════════════════════════════════════════════════════════
+
+BEFORE:
+  output_dir.mkdir(parents=True, exist_ok=True)
+  docs_df.to_csv(output_dir / "bertopic_clustered_documents.csv", index=False)
+
+AFTER:
+  if output_dir.exists():
+      import shutil
+      shutil.rmtree(output_dir)
+  output_dir.mkdir(parents=True, exist_ok=True)
+  cols = ["raw_text", "clean_text", "ner_text", "topic_id", "topic_label"]
+  output_df = docs_df[[c for c in cols if c in docs_df.columns]]
+  output_df.to_csv(output_dir / "bertopic_clustered_documents.csv", index=False)
+
+WHY: Previous output had 10+ columns. Simplified to 5 essential columns.
+     Also cleans output directory before writing to prevent file clutter.
+
+═══════════════════════════════════════════════════════════════

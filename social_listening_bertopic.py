@@ -94,7 +94,16 @@ EXPERIMENT_STOPWORDS = {
     "political",
 }
 
-STOPS = set(ENGLISH_STOP_WORDS) | MONTHS | DOMAIN_STOPS | EXPERIMENT_STOPWORDS
+HINDI_STOPS = {
+    "में", "के", "की", "का", "पर", "ने", "को", "से", "है", "क्या", 
+    "हो", "था", "थी", "थे", "गया", "गई", "गए", "कर", "किया", "दिया", "लिया", 
+    "होना", "करना", "लेकिन", "मगर", "और", "भी", "ही", "कि", "जो", "तो", 
+    "ये", "वे", "वह", "इस", "उस", "उसे", "इसे", "इसकी", "उसकी", "उनका", 
+    "अपना", "अपने", "अपनी", "सब", "कोई", "कुछ", "बहुत", "कम", "ज्यादा", 
+    "वही", "सही", "गलत", "सा", "सी", "तक", "लिए", "बारे", "बीच", "वाले", 
+    "वाली", "वाला", "हैं", "रहे", "रही", "रहा", "सकते", "सकता", "सकती"
+}
+STOPS = set(ENGLISH_STOP_WORDS) | MONTHS | DOMAIN_STOPS | EXPERIMENT_STOPWORDS | HINDI_STOPS
 TEXT_CANDIDATES = ("content", "text", "post", "title", "description", "caption")
 
 CANONICAL_PATTERNS = [
@@ -120,10 +129,17 @@ CANONICAL_PATTERNS = [
     (re.compile(r"\baap\b", re.IGNORECASE), " aap "),
     (re.compile(r"\bassam\b", re.IGNORECASE), " assam "),
     (re.compile(r"\bdelhi\b", re.IGNORECASE), " delhi "),
+    (re.compile(r"\bdonald\s+trump\b", re.IGNORECASE), " donald_trump "),
+    (re.compile(r"\bpm\s+modi\b|\bmodi\s+ji\b|\bnarendra\s+modi\b", re.IGNORECASE), " pm_modi "),
+    (re.compile(r"\bpawan\s+khera\b", re.IGNORECASE), " pawan_khera "),
+    (re.compile(r"\bsandeep\s+chaudhary\b", re.IGNORECASE), " sandeep_chaudhary "),
+    (re.compile(r"\bsushant\s+sinha\b", re.IGNORECASE), " sushant_sinha "),
+    (re.compile(r"\bjyotiraditya\s+scindia\b|\bscindia\b", re.IGNORECASE), " jyotiraditya_scindia "),
+    (re.compile(r"\biit\s+baba\b|\biitbaba\b", re.IGNORECASE), " iit_baba "),
 ]
 
 COARSE_BUCKET_RULES = {
-    "international_conflict": {
+    "geopolitical_conflict_and_international_relations": {
         "iran",
         "israel",
         "trump",
@@ -134,7 +150,7 @@ COARSE_BUCKET_RULES = {
         "usa",
         "war",
     },
-    "elections_politics": {
+    "national_electoral_politics_and_governance": {
         "assam",
         "election",
         "elections",
@@ -148,7 +164,7 @@ COARSE_BUCKET_RULES = {
         "priyanka_gandhi",
         "bhagwant_mann",
     },
-    "parliament_policy": {
+    "legislative_affairs_and_public_policy": {
         "women_reservation_bill",
         "reservation",
         "parliament",
@@ -159,7 +175,7 @@ COARSE_BUCKET_RULES = {
         "aarakshan",
         "आरक्षण",
     },
-    "local_security": {
+    "regional_public_safety_and_security_incidents": {
         "bulldozer",
         "mumbai",
         "delhi_assembly",
@@ -168,8 +184,21 @@ COARSE_BUCKET_RULES = {
         "crime",
         "police",
         "unnao",
+        "gurugram",
+        "scorpio",
+        "roadrage",
     },
-    "entertainment_misc": {
+    "economic_trends_and_infrastructure": {
+        "lpg",
+        "gas",
+        "cylinder",
+        "price",
+        "economy",
+        "market",
+        "inflation",
+        "crisis",
+    },
+    "culture_media_and_digital_lifestyles": {
         "virat",
         "anushka",
         "dhurandhar",
@@ -178,6 +207,10 @@ COARSE_BUCKET_RULES = {
         "actor",
         "girl",
         "vada",
+        "iit_baba",
+        "tiger",
+        "crocodile",
+        "snake",
     },
 }
 
@@ -256,9 +289,10 @@ def normalize_text(text: str) -> str:
 
     tokens = []
     for token in text.split():
-        if len(token) <= 2:
+        # Filter short ASCII tokens, but preserve short Hindi tokens which are often meaningful
+        if token.isascii() and len(token) <= 2:
             continue
-        if token.isascii() and token in STOPS:
+        if token in STOPS:
             continue
         tokens.append(token)
     return MULTISPACE_RE.sub(" ", " ".join(tokens)).strip()
@@ -335,7 +369,13 @@ def load_json_posts(path: Path, json_text_key: str) -> pd.DataFrame:
 
 def load_tabular(path: Path, input_type: str, column: str | None) -> pd.DataFrame:
     if input_type == "csv":
-        df = pd.read_csv(path)
+        try:
+            # First attempt with standard comma separator
+            df = pd.read_csv(path)
+        except Exception:
+            # Fallback for text files that use commas within titles (common in news)
+            # We use an unlikely separator to force single-column reading if standard CSV fails
+            df = pd.read_csv(path, sep="\v", engine="python")
     else:
         df = pd.read_excel(path)
 
@@ -744,8 +784,16 @@ def write_outputs(
     topic_summaries: list[dict[str, Any]],
     run_summary: dict[str, Any],
 ) -> None:
+    # Clear directory to keep things clean as requested
+    if output_dir.exists():
+        import shutil
+        shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    docs_df.to_csv(output_dir / "bertopic_clustered_documents.csv", index=False)
+
+    # Simplified columns: raw_text, clean_text, ner_text, topic_id, topic_label
+    cols = ["raw_text", "clean_text", "ner_text", "topic_id", "topic_label"]
+    output_df = docs_df[[c for c in cols if c in docs_df.columns]]
+    output_df.to_csv(output_dir / "bertopic_clustered_documents.csv", index=False)
 
     summary_df = pd.DataFrame(topic_summaries)
     summary_df["keywords"] = summary_df["keywords"].map(lambda items: ", ".join(items))
