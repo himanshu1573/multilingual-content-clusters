@@ -742,6 +742,7 @@ def build_topic_model(
         "Main": KeyBERTInspired(),
         "MMR": MaximalMarginalRelevance(diversity=0.3),
     }
+
     return BERTopic(
         embedding_model=embedder,
         umap_model=umap_model,
@@ -761,7 +762,9 @@ def run_topic_model(
     topic_model: Any,
     text_column: str,
 ) -> tuple[pd.DataFrame, list[int], Any]:
+    print("Fitting BERTopic model...")
     topics, _ = topic_model.fit_transform(docs, embeddings)
+
     result_df = docs_df.copy()
     result_df["model_text"] = result_df[text_column]
     result_df["topic_id"] = topics

@@ -85,7 +85,7 @@ def deduplicate_entities(entities):
     return deduped
 
 def main():
-    input_file = Path("Video Titles.xlsx")
+    input_file = Path("Video Titles.txt")
     output_file = Path("Video_Titles_NER.csv")
     
     if not input_file.exists():
@@ -93,11 +93,15 @@ def main():
         return
 
     print(f"Loading {input_file}...")
-    df = pd.read_excel(input_file)
+    # Using the robust loader logic for video titles
+    try:
+        df = pd.read_csv(input_file)
+    except Exception:
+        df = pd.read_csv(input_file, sep="\v", engine="python")
     
     if 'title' not in df.columns:
-        print(f"Error: 'title' column not found in {input_file}. Columns: {df.columns.tolist()}")
-        return
+        # Fallback to first column
+        df.columns = ['title'] + list(df.columns[1:])
 
     titles_raw = df['title'].fillna("").astype(str).tolist()
     print("Cleaning titles for NER...")
@@ -111,8 +115,8 @@ def main():
         device = 0
     print(f"Using device: {device}")
 
-    # Using high-accuracy multilingual model
-    model_name = "Davlan/xlm-roberta-large-ner-hrl"
+    # Using high-speed, accurate multilingual model
+    model_name = "Babelscape/wikineural-multilingual-ner"
     print(f"Initializing NER Pipeline with {model_name}...")
     ner_pipe = pipeline(
         "ner", 
@@ -125,27 +129,30 @@ def main():
     results = []
     print(f"Extracting entities from {len(titles_raw)} titles...")
     
-    batch_size = 16
+    batch_size = 32
     for i in tqdm(range(0, len(titles_clean), batch_size)):
         batch_titles_clean = titles_clean[i : i + batch_size]
         batch_titles_raw = titles_raw[i : i + batch_size]
         
         try:
-            # Filters out empty strings to avoid errors
-            valid_batch = [(t, r) for t, r in zip(batch_titles_clean, batch_titles_raw) if t.strip()]
-            if not valid_batch:
+            # Filter out empty strings to avoid errors
+            # We must keep track of which indices were valid to map results back correctly
+            valid_indices = [idx for idx, t in enumerate(batch_titles_clean) if t.strip()]
+            
+            if not valid_indices:
                 for r in batch_titles_raw:
                     results.append({"Original Title": r, "Persons": "", "Organizations": "", "Locations": ""})
                 continue
             
-            clean_inputs = [v[0] for v in valid_batch]
+            clean_inputs = [batch_titles_clean[idx] for idx in valid_indices]
             batch_results = ner_pipe(clean_inputs)
             
             # Map results back to index
-            valid_idx = 0
+            results_idx = 0
             for j in range(len(batch_titles_raw)):
-                if batch_titles_raw[j] in [v[1] for v in valid_batch] and batch_titles_clean[j].strip():
-                    entities_raw = batch_results[valid_idx] if len(valid_batch) > 1 else batch_results
+                if j in valid_indices:
+                    entities_raw = batch_results[results_idx]
+                    
                     if isinstance(entities_raw, dict): # Single result case
                         entities_raw = [entities_raw]
                     
@@ -156,7 +163,7 @@ def main():
                         "Organizations": deduped.get("ORG", ""),
                         "Locations": deduped.get("LOC", "")
                     })
-                    valid_idx += 1
+                    results_idx += 1
                 else:
                     results.append({
                         "Original Title": batch_titles_raw[j],
