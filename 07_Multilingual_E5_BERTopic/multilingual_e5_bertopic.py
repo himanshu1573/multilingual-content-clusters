@@ -1,3 +1,16 @@
+"""
+BERTopic Clustering Pipeline for Multilingual Social Listening Data.
+
+This script implements a production-grade clustering pipeline designed for a News Agency
+to organize large volumes of video titles and social media posts into distinct news stories.
+
+Key Technologies:
+- Embeddings: Multilingual-E5-Large (supports translation-free comparison of Hindi/English/Hinglish).
+- Clustering: BERTopic + HDBSCAN (density-based discovery of natural topics).
+- Labeling: Ollama (Qwen 2.5) for generating professional, Google-Search-optimized headlines.
+- Preprocessing: Advanced regex-based entity normalization (Canonical Patterns).
+"""
+
 import argparse
 import hashlib
 import html
@@ -13,87 +26,38 @@ import pandas as pd
 import requests
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
 from sklearn.metrics import calinski_harabasz_score, silhouette_score
+from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
 
+
+# --- 1. Global Configuration & Stopwords ---
+# These lists filter out "noise" words that often appear in news/social media
+# but don't contribute to the meaning of a news story.
 
 MONTHS = {
-    "january",
-    "february",
-    "march",
-    "april",
-    "may",
-    "june",
-    "july",
-    "august",
-    "september",
-    "october",
-    "november",
-    "december",
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
 }
 
+# Platform-specific "noise" (e.g., 'breakingnews', 'subscribe')
 DOMAIN_STOPS = {
-    "abp",
-    "amp",
-    "breaking",
-    "breakingnews",
-    "channel",
-    "click",
-    "com",
-    "editorinchief",
-    "exclusive",
-    "facebook",
-    "follow",
-    "hindi",
-    "http",
-    "https",
-    "inchief",
-    "instagram",
-    "latest",
-    "live",
-    "mobile",
-    "ndtv",
-    "news",
-    "playlist",
-    "rahul",
-    "rahulkanwal",
-    "share",
-    "shorts",
-    "shots",
-    "shows",
-    "subscribe",
-    "today",
-    "tonight",
-    "tweet",
-    "updates",
-    "video",
-    "videos",
-    "watch",
-    "whatsapp",
-    "www",
-    "xcom",
-    "viral",
-    "viralnews",
-    "viralvideo",
-    "ytshorts",
-    "youtube",
+    "abp", "amp", "breaking", "breakingnews", "channel", "click", "com",
+    "editorinchief", "exclusive", "facebook", "follow", "hindi", "http",
+    "https", "inchief", "instagram", "latest", "live", "mobile", "ndtv",
+    "news", "playlist", "rahul", "rahulkanwal", "share", "shorts", "shots",
+    "shows", "subscribe", "today", "tonight", "tweet", "updates", "video",
+    "videos", "watch", "whatsapp", "www", "xcom", "viral", "viralnews",
+    "viralvideo", "ytshorts", "youtube", "politics", "viral",
 }
 
+# Media-specific stopwords to ignore channel names
 EXPERIMENT_STOPWORDS = {
-    "aajtak",
-    "aajtakdigital",
-    "ndtvindia",
-    "timesnownavbharat",
-    "tv9",
-    "tv9d",
-    "news18",
-    "n18s",
-    "topnews",
-    "parliamentnews",
-    "shortvideo",
-    "shortsvideo",
-    "viralshorts",
-    "political",
+    "aajtak", "aajtakdigital", "ndtvindia", "timesnownavbharat", "tv9",
+    "tv9d", "news18", "n18s", "topnews", "parliamentnews", "shortvideo",
+    "shortsvideo", "viralshorts", "political",
 }
 
+# Hindi connectors and common functional words
 HINDI_STOPS = {
     "में", "के", "की", "का", "पर", "ने", "को", "से", "है", "क्या", 
     "हो", "था", "थी", "थे", "गया", "गई", "गए", "कर", "किया", "दिया", "लिया", 
@@ -103,9 +67,15 @@ HINDI_STOPS = {
     "वही", "सही", "गलत", "सा", "सी", "तक", "लिए", "बारे", "बीच", "वाले", 
     "वाली", "वाला", "हैं", "रहे", "रही", "रहा", "सकते", "सकता", "सकती"
 }
+
 STOPS = set(ENGLISH_STOP_WORDS) | MONTHS | DOMAIN_STOPS | EXPERIMENT_STOPWORDS | HINDI_STOPS
+
+# Column names to look for in input files if not specified
 TEXT_CANDIDATES = ("content", "text", "post", "title", "description", "caption")
 
+# --- 2. Entity Normalization (The "Nickname Resolver") ---
+# This list maps various ways people write names to a single "Clean Token".
+# This forces the AI to group "PM Modi" and "Narendra Modi" into the same topic.
 CANONICAL_PATTERNS = [
     (re.compile(r"\brahul\s+gandhi\b|\brahulgandhi\b", re.IGNORECASE), " rahul_gandhi "),
     (
@@ -135,7 +105,9 @@ CANONICAL_PATTERNS = [
     (re.compile(r"\bsandeep\s+chaudhary\b", re.IGNORECASE), " sandeep_chaudhary "),
     (re.compile(r"\bsushant\s+sinha\b", re.IGNORECASE), " sushant_sinha "),
     (re.compile(r"\bjyotiraditya\s+scindia\b|\bscindia\b", re.IGNORECASE), " jyotiraditya_scindia "),
-    (re.compile(r"\biit\s+baba\b|\biitbaba\b", re.IGNORECASE), " iit_baba "),
+    (re.compile(r"\biit\s+baba\b|\biitbaba\b|\biitian\s+baba\b", re.IGNORECASE), " iit_baba "),
+    (re.compile(r"\babhay\s+singh\b", re.IGNORECASE), " abhay_singh "),
+    (re.compile(r"\bharmuz\b", re.IGNORECASE), " strait_of_hormuz "),
 ]
 
 COARSE_BUCKET_RULES = {
@@ -214,6 +186,7 @@ COARSE_BUCKET_RULES = {
     },
 }
 
+# --- 3. Preprocessing Regex Patterns ---
 AC_CODE_RE = re.compile(r"AC/\d{1,4}/\d{1,4}", re.IGNORECASE)
 URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 MENTION_RE = re.compile(r"@\w+")
@@ -225,6 +198,7 @@ MULTISPACE_RE = re.compile(r"\s+")
 
 
 def ensure_base_dependencies() -> tuple[Any, Any, Any, Any, Any, Any]:
+    """Imports and verifies major BERTopic dependencies."""
     try:
         from bertopic import BERTopic
         from bertopic.representation import KeyBERTInspired, MaximalMarginalRelevance
@@ -242,11 +216,21 @@ def ensure_base_dependencies() -> tuple[Any, Any, Any, Any, Any, Any]:
 
 
 def load_embedder(sentence_transformer_cls: Any, model_name: str) -> Any:
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    """Loads the SentenceTransformer model (Local-first)."""
     try:
         return sentence_transformer_cls(model_name, local_files_only=True)
     except TypeError:
         return sentence_transformer_cls(model_name)
+    except Exception:
+        return sentence_transformer_cls(model_name)
+
+
+def prepare_embedding_inputs(texts: list[str], model_name: str) -> list[str]:
+    """Adds 'passage: ' prefix to texts if using the E5 model for better semantic indexing."""
+    lowered = model_name.lower()
+    if "e5" not in lowered:
+        return texts
+    return [f"passage: {text}" for text in texts]
 
 
 def parse_nr_topics(value: str | None) -> int | str | None:
@@ -275,6 +259,13 @@ def detect_input_type(path: Path, input_type: str) -> str:
 
 
 def normalize_text(text: str) -> str:
+    """
+    Performs deep cleaning of raw text:
+    1. Unescapes HTML (e.g., &amp; -> &)
+    2. Strips URLs, mentions, and codes
+    3. Splits CamelCase (e.g., BreakingNews -> Breaking News)
+    4. Lowercases and filters stopwords
+    """
     if not isinstance(text, str):
         return ""
     text = html.unescape(text)
@@ -289,7 +280,7 @@ def normalize_text(text: str) -> str:
 
     tokens = []
     for token in text.split():
-        # Filter short ASCII tokens, but preserve short Hindi tokens which are often meaningful
+        # Short ASCII tokens (1-2 chars) are usually noise, but short Hindi tokens can be words
         if token.isascii() and len(token) <= 2:
             continue
         if token in STOPS:
@@ -299,6 +290,7 @@ def normalize_text(text: str) -> str:
 
 
 def normalize_entities(text: str) -> str:
+    """Applies the CANONICAL_PATTERNS regex mapping for entity normalization."""
     value = html.unescape(text or "")
     for pattern, replacement in CANONICAL_PATTERNS:
         value = pattern.sub(replacement, value)
@@ -409,12 +401,59 @@ def load_input(path: Path, input_type: str, column: str | None, json_text_key: s
 
 
 def dedupe_documents(df: pd.DataFrame, enabled: bool) -> pd.DataFrame:
+    """Performs exact string deduplication on cleaned text."""
     if not enabled:
         return df.reset_index(drop=True)
     subset = ["clean_text"]
     if "ner_text" in df.columns:
         subset.append("ner_text")
     return df.drop_duplicates(subset=subset).reset_index(drop=True)
+
+
+def semantic_dedupe(
+    df: pd.DataFrame,
+    embeddings: np.ndarray,
+    threshold: float = 0.96,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """
+    Identifies and removes semantically redundant documents.
+    If two documents are >96% similar, only the one with the longer text is kept.
+    """
+    print(f"Performing semantic deduplication (threshold={threshold})...")
+    
+    # Calculate cosine similarity between all pairs
+    # Note: For very large datasets (>20k), this should be batched
+    sim_matrix = cosine_similarity(embeddings)
+    
+    # Mask to keep track of rows to drop
+    to_drop = np.zeros(len(df), dtype=bool)
+    
+    for i in tqdm(range(len(df)), desc="Checking for duplicates"):
+        if to_drop[i]:
+            continue
+            
+        # Find all documents similar to 'i'
+        similar_indices = np.where(sim_matrix[i] > threshold)[0]
+        
+        for j in similar_indices:
+            if i == j or to_drop[j]:
+                continue
+                
+            # If we find a highly similar pair, keep the one with longer text
+            if len(df.iloc[i]["raw_text"]) >= len(df.iloc[j]["raw_text"]):
+                to_drop[j] = True
+            else:
+                to_drop[i] = True
+                break
+                
+    keep_mask = ~to_drop
+    new_df = df[keep_mask].reset_index(drop=True)
+    new_embeddings = embeddings[keep_mask]
+    
+    removed = len(df) - len(new_df)
+    print(f"Removed {removed} semantically redundant documents. {len(new_df)} remain.")
+    
+    return new_df, new_embeddings
 
 
 def select_text_column(df: pd.DataFrame, text_variant: str) -> str:
@@ -533,6 +572,10 @@ def generate_llm_label(
     fallback_label: str,
     labeler: Any,
 ) -> str:
+    """
+    Sends topic data to the LLM to generate a professional news headline.
+    This is what creates the final 'Search API' optimized labels.
+    """
     doc_block = "\n".join(
         f"{idx}. {doc[:280].replace(chr(10), ' ')}"
         for idx, doc in enumerate(representative_docs[:3], start=1)
@@ -555,6 +598,7 @@ def generate_llm_label(
 def summarize_topics(topic_model: Any, docs_df: pd.DataFrame, topics: list[int]) -> list[dict[str, Any]]:
     topic_counts = docs_df["topic_id"].value_counts().to_dict()
     summaries: list[dict[str, Any]] = []
+    representative_doc_map = topic_model.get_representative_docs()
 
     for topic_id in sorted(set(topics)):
         if topic_id == -1:
@@ -573,7 +617,10 @@ def summarize_topics(topic_model: Any, docs_df: pd.DataFrame, topics: list[int])
 
         keyword_pairs = topic_model.get_topic(topic_id) or []
         keywords = [word for word, _ in keyword_pairs[:10]]
-        representative_docs = (topic_model.get_representative_docs(topic_id) or [])[:5]
+        representative_docs = representative_doc_map.get(topic_id, []) if isinstance(representative_doc_map, dict) else []
+        if isinstance(representative_docs, str):
+            representative_docs = [representative_docs]
+        representative_docs = list(representative_docs[:5])
         summaries.append(
             {
                 "topic_id": int(topic_id),
@@ -660,6 +707,11 @@ def assign_topic_labels(
 
 
 def calculate_metrics(embeddings: np.ndarray, topic_ids: np.ndarray) -> dict[str, Any]:
+    """
+    Calculates statistical quality scores for the clusters:
+    1. Silhouette Score: Measures how distinct and separate clusters are (-1 to 1).
+    2. Calinski-Harabasz: Measures density and separation.
+    """
     mask = topic_ids != -1
     clustered_embeddings = embeddings[mask]
     clustered_topics = topic_ids[mask]
@@ -711,6 +763,13 @@ def build_topic_model(
     top_n_words: int,
     doc_count: int | None = None,
 ) -> Any:
+    """
+    Configures and assembles the BERTopic model components:
+    1. Vectorizer: Tokenizes text and counts word frequency (c-TF-IDF).
+    2. UMAP: Reduces embedding dimensions from 1024 to low-dimension space (e.g., 5).
+    3. HDBSCAN: Groups documents in the low-dimension space based on density.
+    4. Representation: Uses Keywords and MMR for initial descriptive strings.
+    """
     safe_min_df: int | float = min_df
     safe_max_df: int | float = max_df
     if doc_count is not None and doc_count > 0:
@@ -719,12 +778,15 @@ def build_topic_model(
             safe_min_df = 1
             safe_max_df = 1.0
 
+    # Counts word/ngram frequencies within clusters
     vectorizer = CountVectorizer(
         stop_words="english",
         ngram_range=(1, 3),
         min_df=safe_min_df,
         max_df=safe_max_df,
     )
+
+    # Compresses the complex 1024-dimension space into a visualizable density map
     umap_model = umap_module.UMAP(
         n_neighbors=umap_n_neighbors,
         n_components=umap_components,
@@ -732,6 +794,8 @@ def build_topic_model(
         metric="cosine",
         random_state=42,
     )
+
+    # Identifiers clusters (Islands of dense points)
     hdbscan_model = hdbscan_module.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
@@ -739,12 +803,14 @@ def build_topic_model(
         cluster_selection_method="eom",
         prediction_data=True,
     )
+    
+    # Visual descriptors for the topics
     representation_model = {
         "Main": KeyBERTInspired(),
         "MMR": MaximalMarginalRelevance(diversity=0.3),
     }
 
-    # Guided Selection based on high-frequency persons
+    # Guided Selection: Tells BERTopic to look specifically for these recurring news entities
     seed_topic_list = [
         ["donald", "trump", "white", "house", "america"],
         ["sandeep", "chaudhary", "news", "analysis"],
@@ -783,14 +849,18 @@ def run_topic_model(
     topic_model: Any,
     text_column: str,
 ) -> tuple[pd.DataFrame, list[int], Any]:
-    print("Fitting BERTopic model with Guided Topics...")
+    """Fits the model and performs aggressive outlier reduction for 100% coverage."""
+    print("Fitting BERTopic model...")
     topics, _ = topic_model.fit_transform(docs, embeddings)
     
-    # --- Step 5: Outlier Reduction (The 'Pure Heart' Mapping) ---
+    # This step compares 'Noise' documents to the nearest clusters and forces them in.
     print("Performing Outlier Reduction to eliminate noise...")
-    # Map outliers based on embedding similarity
-    # We use Strategy 2 from our discussion to force -1 into the nearest centroid.
-    new_topics = topic_model.reduce_outliers(docs, topics, strategy="embeddings")
+    new_topics = topic_model.reduce_outliers(
+        docs,
+        topics,
+        strategy="embeddings",
+        embeddings=embeddings,
+    )
     topic_model.update_topics(docs, topics=new_topics)
     topics = new_topics
 
@@ -801,6 +871,7 @@ def run_topic_model(
 
 
 def calculate_dominance(topic_ids: list[int]) -> float:
+    """Calculates the ratio of the largest cluster to the total population."""
     if not topic_ids:
         return 0.0
     counts = Counter(topic_ids)
@@ -816,6 +887,12 @@ def write_outputs(
     topic_summaries: list[dict[str, Any]],
     run_summary: dict[str, Any],
 ) -> None:
+    """
+    Saves the final results in 3 formats:
+    1. bertopic_clustered_documents.csv - The master list of every title and its cluster.
+    2. bertopic_topic_summary.csv - High-level summary of every news story.
+    3. bertopic_topic_summary.json - Machine-readable blueprint for search APIs.
+    """
     # Clear directory to keep things clean as requested
     if output_dir.exists():
         import shutil
@@ -848,6 +925,10 @@ def write_visualization(
     umap_module: Any,
     plotly_express: Any,
 ) -> None:
+    """
+    Generates an interactive HTML map of the news clusters.
+    Uses UMAP to squash the 1024D vectors into a 2D scatter plot.
+    """
     reducer = umap_module.UMAP(
         n_components=2,
         n_neighbors=15,
@@ -882,7 +963,10 @@ def write_visualization(
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="BERTopic pipeline for social listening data.")
+    """Defines the command-line interface (CLI) for the script."""
+    parser = argparse.ArgumentParser(
+        description="Fresh BERTopic pipeline for multilingual social listening data using multilingual-e5-large."
+    )
     parser.add_argument("--input", required=True, help="Path to JSON, CSV, or XLSX input.")
     parser.add_argument(
         "--input-type",
@@ -898,7 +982,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--embedding-model",
-        default="sentence-transformers/LaBSE",
+        default="intfloat/multilingual-e5-large",
         help="SentenceTransformer model used to create document embeddings.",
     )
     parser.add_argument(
@@ -998,6 +1082,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Skip Plotly HTML visualization output.",
     )
     parser.add_argument(
+        "--semantic-dedupe",
+        action="store_true",
+        default=True,
+        help="Perform AI-based semantic deduplication to remove near-identical news stories.",
+    )
+    parser.add_argument(
+        "--no-semantic-dedupe",
+        action="store_false",
+        dest="semantic_dedupe",
+        help="Disable AI-based semantic deduplication.",
+    )
+    parser.add_argument(
         "--llm-max-new-tokens",
         type=int,
         default=24,
@@ -1018,6 +1114,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """
+    The Orchestrator:
+    1. Parses arguments
+    2. Loads dependencies
+    3. Cleans and dedupes the input data
+    4. Generates E5 embeddings
+    5. Builds and runs the clustering model
+    6. Asks Ollama LLM for headlines
+    7. Saves all reports and visualizations
+    """
     parser = build_argument_parser()
     args = parser.parse_args()
 
@@ -1044,51 +1150,44 @@ def main() -> None:
     print(f"Embedding model: {args.embedding_model}")
 
     embedder = load_embedder(SentenceTransformer, args.embedding_model)
+    embedding_inputs = prepare_embedding_inputs(docs, args.embedding_model)
     embeddings = embedder.encode(
-        docs,
+        embedding_inputs,
         show_progress_bar=True,
         batch_size=args.batch_size,
         normalize_embeddings=True,
     )
 
-    vectorizer = CountVectorizer(
-        stop_words="english",
-        ngram_range=(1, 3),
-        min_df=args.min_df,
-        max_df=args.max_df,
-    )
-    umap_model = umap.UMAP(
-        n_neighbors=args.umap_n_neighbors,
-        n_components=args.umap_components,
-        min_dist=args.umap_min_dist,
-        metric="cosine",
-        random_state=42,
-    )
-    hdbscan_model = hdbscan.HDBSCAN(
+    if args.semantic_dedupe:
+        docs_df, embeddings = semantic_dedupe(docs_df, embeddings)
+        docs = docs_df["clean_text"].tolist()
+
+    topic_model = build_topic_model(
+        BERTopic=BERTopic,
+        KeyBERTInspired=KeyBERTInspired,
+        MaximalMarginalRelevance=MaximalMarginalRelevance,
+        hdbscan_module=hdbscan,
+        umap_module=umap,
+        embedder=embedder,
         min_cluster_size=args.min_cluster_size,
         min_samples=args.min_samples,
-        metric="euclidean",
-        cluster_selection_method="eom",
-        prediction_data=True,
-    )
-    representation_model = {
-        "Main": KeyBERTInspired(),
-        "MMR": MaximalMarginalRelevance(diversity=0.3),
-    }
-
-    topic_model = BERTopic(
-        embedding_model=embedder,
-        umap_model=umap_model,
-        hdbscan_model=hdbscan_model,
-        vectorizer_model=vectorizer,
-        representation_model=representation_model,
-        verbose=True,
+        umap_n_neighbors=args.umap_n_neighbors,
+        umap_components=args.umap_components,
+        umap_min_dist=args.umap_min_dist,
+        min_df=args.min_df,
+        max_df=args.max_df,
         nr_topics=parse_nr_topics(args.nr_topics),
         top_n_words=args.top_n_words,
+        doc_count=len(docs_df),
     )
 
-    topics, _ = topic_model.fit_transform(docs, embeddings)
-    docs_df["topic_id"] = topics
+    docs_df, topics, topic_model = run_topic_model(
+        docs_df=docs_df,
+        docs=docs,
+        embeddings=np.asarray(embeddings),
+        topic_model=topic_model,
+        text_column="clean_text",
+    )
 
     topic_summaries = summarize_topics(topic_model, docs_df, topics)
     label_map, actual_label_mode = assign_topic_labels(
@@ -1112,12 +1211,15 @@ def main() -> None:
         "input_path": str(input_path),
         "documents_used": int(len(docs_df)),
         "embedding_model": args.embedding_model,
+        "embedding_input_prefix": "passage:" if "e5" in args.embedding_model.lower() else None,
         "label_mode_requested": args.label_mode,
         "label_mode_actual": actual_label_mode,
         "llm_model": args.llm_model if args.label_mode == "llm" else None,
         "llm_provider": args.llm_provider if args.label_mode == "llm" else None,
         "min_cluster_size": args.min_cluster_size,
+        "min_samples": args.min_samples,
         "nr_topics": parse_nr_topics(args.nr_topics),
+        "outlier_reduction_strategy": "embeddings",
         "output_dir": str(output_dir),
         **metrics,
     }
